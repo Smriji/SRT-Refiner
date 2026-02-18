@@ -12,9 +12,10 @@ load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 RULES_JSON = "rules.json"
-# 無料版制限に合わせた最適設定
-BATCH_SIZE = 60 
-SLEEP_TIME = 5
+
+BATCH_SIZE = 50  # 今回の修正対象行数（APIのトークン制限を考慮して調整）
+OVERLAP_SIZE = 5 # 前のバッチから持ち越す「参考」行数
+SLEEP_TIME = 5   # API呼び出し間の待機時間（秒）無料版レート制限対策
 
 if not API_KEY:
     raise ValueError("APIキーが見つかりません。.envファイルに GEMINI_API_KEY を設定してください。")
@@ -30,50 +31,70 @@ def load_rules(file_path):
             return json.load(f)
     return {}
 
-def process_batch_with_llm(texts, rules_dict):
-    """JSONモードを使用して、確実に行数と内容を一致させる"""
+def process_batch_with_llm(target_texts, context_texts, rules_dict):
+    """
+    ID飛び（結合）対策強化版
+    """
+    # 1. 入力をID付きオブジェクトに変換
+    structured_target = [{"id": i, "text": t} for i, t in enumerate(target_texts)]
+    
     rules_str = "\n".join([f"- 「{k}」→「{v}」" for k, v in rules_dict.items()])
     
     prompt = f"""
-あなたは動画字幕の専門編集者です。
-入力された {len(texts)} 行の字幕を、以下の指示に従って修正し、必ず【JSONの文字列配列】として出力してください。
+あなたは強力なテキスト校正エンジンです。
+入力された JSONデータの `text` フィールドを修正し、同じ JSON構造で出力してください。
 
-【指示】
-1. 「えー」「あのー」などのフィラーを削除する。
-2. 表記ルールを適用する。
-3. 自然な日本語に整える。
-4. 「1:」などの番号や解説、太字装飾は一切含めないこと。
-5. 入力と同じ {len(texts)} 要素の配列を維持すること。
+【最重要ルール：行の独立性維持】
+* **いかなる理由があっても、行（ID）を結合・削除してはいけません。**
+* 文の途中で改行されている場合、**文法的に不自然であっても、そのままの改行位置を維持してください。**
+* 「前の行とつなげたほうが読みやすい」という判断は**禁止**です。
+
+【textフィールドの修正指示】
+1. **フィラー削除:** 「えー」「あのー」などの無意味な言葉は削除してください。
+2. **ルール適用:** 表記ルールを適用してください。
+3. **自然な日本語:** 文意を変えない範囲で整えてください。ただし、改行位置の移動は禁止です。
 
 【表記ルール】
 {rules_str}
 
-【入力テキスト】
-{json.dumps(texts, ensure_ascii=False)}
+【参考（直前の流れ）】
+{json.dumps(context_texts, ensure_ascii=False)}
+
+【修正対象データ】
+{json.dumps(structured_target, ensure_ascii=False)}
 """
 
     try:
-        # response_mime_type を指定して、必ずJSONで返させる
         response = client.models.generate_content(
             model=MODEL_ID,
-            contents=prompt,
-            config={
-                'response_mime_type': 'application/json',
-            }
+            config={'response_mime_type': 'application/json'},
+            contents=prompt
         )
         
-        # 文字列として返ってきたJSONをPythonのリストに変換
-        results = json.loads(response.text)
+        results_json = json.loads(response.text)
         
-        # 万が一、行数が一致しない場合のログ
-        if len(results) != len(texts):
-            print(f"警告: 行数が一致しません (入力:{len(texts)}, 出力:{len(results)})")
-            
-        return results
+        # IDをキーにした辞書に変換（検索を高速化）
+        result_map = {item.get('id'): item.get('text', '') for item in results_json}
+        
+        fixed_texts = []
+        for i in range(len(target_texts)):
+            if i in result_map:
+                # 正常に修正されたテキスト
+                fixed_texts.append(result_map[i])
+            else:
+                # 【重要】IDが飛んでいる（結合された）場合
+                # 無理に分割しようとせず、オリジナルのテキストをそのまま採用する
+                # これにより、字幕のタイミングズレ（ドミノ倒し）を防ぐ
+                print(f"警告: ID {i} が消失しました。同期ズレを防ぐため原文を使用します: '{target_texts[i]}'")
+                fixed_texts.append(target_texts[i])
+                
+        return fixed_texts
+
     except Exception as e:
-        print(f"APIエラーまたはJSON解析エラー: {e}")
-        return texts
-    
+        print(f"APIエラー: {e}")
+        # エラー時は全行オリジナルを返す（安全策）
+        return target_texts
+
 def main():
     parser = argparse.ArgumentParser(description="SRTファイルをLLM(google-genai)で修正します。")
     parser.add_argument("input_file", help="入力するSRTファイル名")
@@ -88,31 +109,36 @@ def main():
     output_path = input_path.with_name(f"{input_path.stem}_out{input_path.suffix}")
 
     rules = load_rules(RULES_JSON)
+    subs = pysrt.open(str(input_path), encoding='utf-8')
+    total = len(subs)
+
+    previous_fixed_lines = [] # 前のバッチから持ち越す「参考」行を保存するリスト
+
     print(f"モデル: {MODEL_ID}")
     print(f"対応表 {RULES_JSON} から {len(rules)} 件のルールを適用します。")
 
-    subs = pysrt.open(str(input_path), encoding='utf-8')
-    total = len(subs)
-    
     print(f"処理を開始します: {input_path} -> {output_path}")
+    print(f"{total}行 / バッチ:{BATCH_SIZE} / 重複:{OVERLAP_SIZE}")
 
     for i in range(0, total, BATCH_SIZE):
         batch = subs[i:i+BATCH_SIZE]
-        texts = [s.text for s in batch]
+        target_texts = [s.text for s in batch]
         
         print(f"処理中: {i+1}〜{min(i+BATCH_SIZE, total)} / {total} 行")
         
-        fixed_texts = process_batch_with_llm(texts, rules)
+        fixed_texts = process_batch_with_llm(target_texts, previous_fixed_lines, rules)
         
         for j, s in enumerate(batch):
             if j < len(fixed_texts):
                 s.text = fixed_texts[j]
         
+        previous_fixed_lines = fixed_texts[-OVERLAP_SIZE:]
+
         # 無料版レート制限(15RPM)対策
         time.sleep(SLEEP_TIME)
 
     subs.save(str(output_path), encoding='utf-8')
-    print(f"完了しました！")
+    print(f"完了しました: {output_path}")
 
 if __name__ == "__main__":
     main()
