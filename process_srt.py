@@ -71,6 +71,10 @@ def process_batch_with_llm(target_texts, context_texts, rules_dict):
             contents=prompt
         )
         
+        if response.text is None:
+            print("エラー: APIからのレスポンスが空です。")
+            return target_texts
+        
         results_json = json.loads(response.text)
         
         # IDをキーにした辞書に変換（検索を高速化）
